@@ -9,7 +9,11 @@
         Height="860"
         Width="1500"
         MinHeight="640"
-        MinWidth="980">
+        MinWidth="980"
+        AllowDrop="True"
+        SizeChanged="Window_SizeChanged"
+        DragOver="Window_DragOver"
+        Drop="Window_Drop">
     <DockPanel LastChildFill="True" Background="#F3F5F7">
         <Border DockPanel.Dock="Top"
                 Padding="12"
@@ -185,6 +189,7 @@
                           ResizeBehavior="PreviousAndNext"
                           ResizeDirection="Columns"
                           ShowsPreview="True"
+                          DragCompleted="BrowserSplitter_DragCompleted"
                           Visibility="Collapsed" />
 
             <Border x:Name="BrowserPane"
@@ -222,8 +227,8 @@
                                     Margin="0,0,8,0"
                                     Click="BrowserRefreshButton_Click" />
                             <TextBox x:Name="BrowserAddressTextBox"
-                                     MinWidth="220"
-                                     Width="430"
+                                     MinWidth="140"
+                                     Width="300"
                                      VerticalContentAlignment="Center"
                                      Margin="0,0,8,0"
                                      KeyDown="BrowserAddressTextBox_KeyDown" />

@@ -1,27 +1,23 @@
 # Tenhou CSV Reader (Windows, Read-Only)
 
-這個專案是一個 WPF Windows 應用程式，用來讀取超大 CSV（約 5GB）並保持流暢瀏覽。
+WPF Windows 應用程式，專門讀取超大 CSV（可到 5GB 等級），並提供分頁瀏覽、篩選、連結預覽與複製功能。
 
-## 主要功能
+## 功能重點
 
-- Read-only 載入，不修改原始 CSV
-- 分頁讀取與背景索引，避免整檔進記憶體
-- DataGrid 虛擬化顯示，適合大檔案
-- Filter 條件查詢，支援：
-  - `=`, `!=`, `>`, `>=`, `<`, `<=`
-- 右鍵複製功能：
+- Read-only 讀取，不改動原始 CSV
+- 大檔優化：分頁載入 + 背景索引 + DataGrid 虛擬化
+- 支援拖拉 `.csv` 檔到視窗直接開啟
+- Filter 支援：`=`, `!=`, `>`, `>=`, `<`, `<=`
+- 複製功能：
   - `Copy Cell`
-  - `Copy Row As CSV`（CSV 逗號格式，含必要引號跳脫）
-- `Ctrl + C` 複製整列時改為 CSV 格式（不是 tab 分隔）
-- 連結跟隨（Follow Link）：
-  - 滑到連結欄位可看到提示
-  - 按住 `Ctrl` 並點擊可直接用瀏覽器開啟連結
-- 右側分割預覽：
-  - 雙擊連結可在右側內嵌瀏覽面板開啟
-  - 提供返回/前進/重整/外部開啟/關閉
-  - 內嵌引擎改為 Edge WebView2（不再使用 IE WebBrowser）
+  - `Copy Row As CSV`（維持 CSV 格式，不是 tab）
+  - `Ctrl + C` 也使用 CSV 格式
+- 連結互動：
+  - `Ctrl + Click` 外部瀏覽器開啟
+  - `Double Click` 在右側分割面板內嵌開啟
+- 右側瀏覽面板使用 **Edge WebView2**（不是 IE）
 
-## 使用方式
+## 開發執行
 
 1. 進入專案：
    - `cd TenhouCsvReader`
@@ -29,37 +25,68 @@
    - `dotnet build`
 3. 執行：
    - `dotnet run`
-   - 或在根目錄直接執行：
-     - `dotnet run --project TenhouCsvReader/TenhouCsvReader.csproj`
-4. 在程式中按 `Open CSV` 選擇檔案
+4. 或從 repo 根目錄直接執行：
+   - `dotnet run --project TenhouCsvReader/TenhouCsvReader.csproj`
 
-## Filter 語法
+## Filter 範例
 
-- 多條件用逗號分隔
-- 範例：
-  - `prediction = 1, actual = 0, probability > 0.7`
+- `prediction = 1, actual = 0, probability > 0.7`
 - 欄位名稱大小寫不敏感
-- 支援唯一前綴（例如 `pred = 1` 對應 `prediction`）
+- 支援唯一前綴（例如 `pred = 1` 會對到 `prediction`）
 
-## 圖示與 Windows 相容性
+## 圖示
 
-- 來源圖：`images/cover.png`
-- 已轉為多尺寸圖示：`TenhouCsvReader/Assets/app.ico`
-- 內含常見尺寸（16, 20, 24, 32, 40, 48, 64, 96, 128, 256）
-- 專案已設定：
-  - EXE 圖示：`ApplicationIcon`
-  - 視窗圖示：`Icon="Assets/app.ico"`
+- 來源：`images/cover.png`
+- 產物：`TenhouCsvReader/Assets/app.ico`
+- 已做多尺寸（16~256）並套用到 EXE 與視窗圖示。
 
-這樣可以避免在不同 DPI / 縮放比例下圖示過小或失真。
+## Release 交付形式
 
-## 發佈輸出
+本專案支援兩種發佈情境：
 
-- 已建立發佈版本：
-  - `TenhouCsvReader/bin/Release/net9.0-windows/publish/`
+1. MSI 安裝版（建議一般使用者）
+2. Portable ZIP 免安裝版（解壓後直接執行）
+
+### 一鍵產生 Release
+
+在 repo 根目錄執行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1
+```
+
+或指定新版 MSI 版本（舊版會自動升級）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1 -ProductVersion 1.0.2
+```
+
+輸出位置：
+
+- `artifacts/TenhouCsvReader-setup-x64.msi`
+- `artifacts/TenhouCsvReader-portable-win-x64.zip`
+- `artifacts/SHA256SUMS.txt`
+
+### MSI 安裝版行為
+
+- 安裝到 `Program Files`（x64）
+- 安裝流程可選擇安裝路徑
+- 安裝流程可輸入 Start Menu 名稱
+- 安裝流程可勾選是否建立桌面捷徑
+- 建立開始選單項目與解除安裝捷徑（名稱依安裝時輸入）
+- 安裝完成頁可勾選「立即開啟程式」
+- 使用固定 `UpgradeCode` + `MajorUpgrade`：新版本 `ProductVersion` 較高時會自動偵測舊版並執行升級
+- 會註冊到 Windows 已安裝應用程式清單，可在：
+  - 設定 > 應用程式 > 已安裝應用程式
+  - 直接按「解除安裝」
+
+### Portable ZIP 行為
+
+- 解壓縮後直接執行 `TenhouCsvReader.exe`
+- 不寫入安裝註冊資訊（不會出現在已安裝應用程式清單）
 
 ## WebView2 注意事項
 
 - 右側內嵌瀏覽需要 Microsoft Edge WebView2 Runtime。
-- 大多數 Windows 10/11 已內建；若目標機器沒有，安裝後即可使用內嵌瀏覽。
-
-若你要我再幫你做安裝包（例如 `MSIX` 或 `Inno Setup`），我可以直接接著加。
+- WebView2 使用者資料夾會寫到 `%LOCALAPPDATA%\\TenhouCsvReader\\WebView2`，避免安裝到 `Program Files` 時發生權限問題。
+- 多數 Windows 10/11 已內建；若目標機器缺少，安裝後即可使用內嵌瀏覽。

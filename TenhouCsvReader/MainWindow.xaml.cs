@@ -1,4 +1,5 @@
 using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.Wpf;
 using Microsoft.Win32;
 using System.Diagnostics;
 using System.Data;
@@ -9,6 +10,7 @@ using System.Text;
 using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -33,6 +35,11 @@ public partial class MainWindow : Window
     private string _activeFilterText = string.Empty;
     private string? _currentEmbeddedUrl;
     private int _currentPageIndex;
+    private const double BrowserPaneMinWidth = 460;
+    private const double BrowserPaneDefaultWidth = 560;
+    private const double BrowserPaneMinGridWidth = 460;
+    private double _lastBrowserPaneWidth = BrowserPaneDefaultWidth;
+    private readonly string _uiStateFilePath;
     private bool _isBusy;
     private bool _isBrowserPaneOpen;
     private bool _hasPreviousPage;
@@ -42,7 +49,11 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
 
+        _uiStateFilePath = BuildUiStateFilePath();
+        LoadUiState();
+
         TryApplyWindowIcon();
+        ConfigureSideBrowserUserDataFolder();
 
         _defaultCellTextStyle = BuildCellTextStyle(showToolTip: false, isLinkStyle: false);
         _tenhouLinkCellTextStyle = BuildCellTextStyle(showToolTip: true, isLinkStyle: true);
@@ -50,6 +61,35 @@ public partial class MainWindow : Window
         ApplyControlState();
         UpdateBrowserControlsState();
         _ = EnsureSideBrowserInitializedAsync();
+    }
+
+    private void ConfigureSideBrowserUserDataFolder()
+    {
+        try
+        {
+            if (SideBrowser.CreationProperties is not null)
+            {
+                return;
+            }
+
+            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (string.IsNullOrWhiteSpace(localAppData))
+            {
+                return;
+            }
+
+            var userDataFolder = Path.Combine(localAppData, "TenhouCsvReader", "WebView2");
+            Directory.CreateDirectory(userDataFolder);
+
+            SideBrowser.CreationProperties = new CoreWebView2CreationProperties
+            {
+                UserDataFolder = userDataFolder
+            };
+        }
+        catch
+        {
+            // Fallback to default behavior if user data path setup fails.
+        }
     }
 
     private void TryApplyWindowIcon()
@@ -84,8 +124,58 @@ public partial class MainWindow : Window
 
     protected override async void OnClosed(EventArgs e)
     {
+        SaveUiState();
         await DisposeReaderAsync();
         base.OnClosed(e);
+    }
+
+    private void Window_DragOver(object sender, DragEventArgs e)
+    {
+        e.Effects = TryGetDroppedCsvPath(e.Data, out _)
+            ? DragDropEffects.Copy
+            : DragDropEffects.None;
+        e.Handled = true;
+    }
+
+    private async void Window_Drop(object sender, DragEventArgs e)
+    {
+        if (_isBusy)
+        {
+            IndexStatusTextBlock.Text = "Please wait for the current operation to finish.";
+            e.Handled = true;
+            return;
+        }
+
+        if (!TryGetDroppedCsvPath(e.Data, out var csvPath))
+        {
+            IndexStatusTextBlock.Text = "Drop a single .csv file to open.";
+            e.Handled = true;
+            return;
+        }
+
+        await OpenCsvAsync(csvPath);
+        e.Handled = true;
+    }
+
+    private void Window_SizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        if (!_isBrowserPaneOpen)
+        {
+            return;
+        }
+
+        EnsureBrowserPaneLayout(useDefaultWhenCollapsed: false);
+    }
+
+    private void BrowserSplitter_DragCompleted(object sender, DragCompletedEventArgs e)
+    {
+        if (!_isBrowserPaneOpen)
+        {
+            return;
+        }
+
+        EnsureBrowserPaneLayout(useDefaultWhenCollapsed: false);
+        SaveUiState();
     }
 
     private async void OpenCsvButton_Click(object sender, RoutedEventArgs e)
@@ -103,6 +193,17 @@ public partial class MainWindow : Window
         }
 
         await OpenCsvAsync(dialog.FileName);
+    }
+
+    public async Task OpenCsvFromLaunchAsync(string filePath)
+    {
+        if (!TryValidateCsvPath(filePath, out var normalizedPath, out var errorMessage))
+        {
+            IndexStatusTextBlock.Text = $"Open startup file failed: {errorMessage}";
+            return;
+        }
+
+        await OpenCsvAsync(normalizedPath);
     }
 
     private async void PreviousPageButton_Click(object sender, RoutedEventArgs e)
@@ -983,14 +1084,33 @@ public partial class MainWindow : Window
         BrowserSplitter.Visibility = Visibility.Visible;
         BrowserSplitterColumn.Width = new GridLength(6);
 
-        if (BrowserColumn.Width.Value <= 0)
-        {
-            BrowserColumn.Width = new GridLength(0.9, GridUnitType.Star);
-        }
-
-        BrowserColumn.MinWidth = 360;
+        EnsureBrowserPaneLayout(useDefaultWhenCollapsed: true);
         _ = EnsureSideBrowserInitializedAsync();
         UpdateBrowserControlsState();
+    }
+
+    private void EnsureBrowserPaneLayout(bool useDefaultWhenCollapsed)
+    {
+        BrowserColumn.MinWidth = BrowserPaneMinWidth;
+
+        var maxBrowserWidth = Math.Max(
+            BrowserPaneMinWidth,
+            ActualWidth - BrowserPaneMinGridWidth - BrowserSplitterColumn.Width.Value - 32);
+
+        var currentWidth = BrowserColumn.ActualWidth;
+        if (BrowserColumn.Width.IsAbsolute && BrowserColumn.Width.Value > 0)
+        {
+            currentWidth = BrowserColumn.Width.Value;
+        }
+
+        if (currentWidth <= 0 || double.IsNaN(currentWidth))
+        {
+            currentWidth = useDefaultWhenCollapsed ? _lastBrowserPaneWidth : BrowserPaneMinWidth;
+        }
+
+        var clampedWidth = Math.Min(maxBrowserWidth, Math.Max(BrowserPaneMinWidth, currentWidth));
+        _lastBrowserPaneWidth = clampedWidth;
+        BrowserColumn.Width = new GridLength(clampedWidth, GridUnitType.Pixel);
     }
 
     private void HideBrowserPane()
@@ -1017,6 +1137,10 @@ public partial class MainWindow : Window
         BrowserPane.Visibility = Visibility.Collapsed;
         BrowserSplitter.Visibility = Visibility.Collapsed;
         BrowserSplitterColumn.Width = new GridLength(0);
+        if (BrowserColumn.ActualWidth > 0)
+        {
+            _lastBrowserPaneWidth = BrowserColumn.ActualWidth;
+        }
         BrowserColumn.Width = new GridLength(0);
         BrowserColumn.MinWidth = 0;
         UpdateBrowserControlsState();
@@ -1037,10 +1161,24 @@ public partial class MainWindow : Window
             BrowserAddressTextBox.Text = url;
             if (SideBrowser.CoreWebView2 is not null)
             {
-                SideBrowser.CoreWebView2.Navigate(url);
+                var core = SideBrowser.CoreWebView2;
+                if (string.Equals(core.Source, url, StringComparison.OrdinalIgnoreCase))
+                {
+                    core.Reload();
+                }
+                else
+                {
+                    core.Navigate(url);
+                }
             }
             else
             {
+                if (SideBrowser.Source is not null &&
+                    string.Equals(SideBrowser.Source.AbsoluteUri, url, StringComparison.OrdinalIgnoreCase))
+                {
+                    SideBrowser.Source = new Uri("about:blank");
+                }
+
                 SideBrowser.Source = new Uri(url);
             }
 
@@ -1096,6 +1234,62 @@ public partial class MainWindow : Window
 
         normalizedUrl = uri.AbsoluteUri;
         return true;
+    }
+
+    private static string BuildUiStateFilePath()
+    {
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (string.IsNullOrWhiteSpace(localAppData))
+        {
+            localAppData = AppContext.BaseDirectory;
+        }
+
+        return Path.Combine(localAppData, "TenhouCsvReader", "ui-state.txt");
+    }
+
+    private void LoadUiState()
+    {
+        try
+        {
+            if (!File.Exists(_uiStateFilePath))
+            {
+                return;
+            }
+
+            var rawText = File.ReadAllText(_uiStateFilePath).Trim();
+            if (!double.TryParse(rawText, NumberStyles.Float, CultureInfo.InvariantCulture, out var savedWidth))
+            {
+                return;
+            }
+
+            if (savedWidth >= BrowserPaneMinWidth)
+            {
+                _lastBrowserPaneWidth = savedWidth;
+            }
+        }
+        catch
+        {
+            // Ignore bad state file and keep defaults.
+        }
+    }
+
+    private void SaveUiState()
+    {
+        try
+        {
+            var folderPath = Path.GetDirectoryName(_uiStateFilePath);
+            if (!string.IsNullOrWhiteSpace(folderPath))
+            {
+                Directory.CreateDirectory(folderPath);
+            }
+
+            var widthToPersist = _lastBrowserPaneWidth <= 0 ? BrowserPaneDefaultWidth : _lastBrowserPaneWidth;
+            File.WriteAllText(_uiStateFilePath, widthToPersist.ToString(CultureInfo.InvariantCulture));
+        }
+        catch
+        {
+            // Keep shutdown resilient if state persistence fails.
+        }
     }
 
     private static bool IsCtrlPressed()
@@ -1330,6 +1524,84 @@ public partial class MainWindow : Window
         }
 
         return false;
+    }
+
+    private static bool TryGetDroppedCsvPath(IDataObject dataObject, out string csvPath)
+    {
+        csvPath = string.Empty;
+
+        if (!dataObject.GetDataPresent(DataFormats.FileDrop))
+        {
+            return false;
+        }
+
+        if (dataObject.GetData(DataFormats.FileDrop) is not string[] droppedPaths || droppedPaths.Length != 1)
+        {
+            return false;
+        }
+
+        var candidatePath = droppedPaths[0];
+        if (string.IsNullOrWhiteSpace(candidatePath) || !File.Exists(candidatePath))
+        {
+            return false;
+        }
+
+        if (!string.Equals(Path.GetExtension(candidatePath), ".csv", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        csvPath = candidatePath;
+        return true;
+    }
+
+    private static bool TryValidateCsvPath(string filePath, out string normalizedPath, out string errorMessage)
+    {
+        normalizedPath = string.Empty;
+        errorMessage = string.Empty;
+
+        var candidatePath = filePath?.Trim();
+        if (string.IsNullOrWhiteSpace(candidatePath))
+        {
+            errorMessage = "path is empty.";
+            return false;
+        }
+
+        while (candidatePath.Length >= 2 &&
+               ((candidatePath[0] == '"' && candidatePath[^1] == '"') ||
+                (candidatePath[0] == '\'' && candidatePath[^1] == '\'')))
+        {
+            candidatePath = candidatePath[1..^1].Trim();
+        }
+
+        if (Uri.TryCreate(candidatePath, UriKind.Absolute, out var uri) && uri.IsFile)
+        {
+            candidatePath = uri.LocalPath;
+        }
+
+        try
+        {
+            normalizedPath = Path.GetFullPath(candidatePath);
+        }
+        catch (Exception ex)
+        {
+            errorMessage = $"invalid path ({ex.Message})";
+            return false;
+        }
+
+        if (!File.Exists(normalizedPath))
+        {
+            errorMessage = $"file not found ({normalizedPath})";
+            return false;
+        }
+
+        if (!string.Equals(Path.GetExtension(normalizedPath), ".csv", StringComparison.OrdinalIgnoreCase))
+        {
+            errorMessage = "only .csv files are supported.";
+            return false;
+        }
+
+        return true;
     }
 
     private void SetBusy(bool isBusy)
