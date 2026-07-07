@@ -1,0 +1,233 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package
+    Name="Tenhou CSV Reader"
+    Manufacturer="TenhouCsvReader"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="7D70A0A2-4B2D-4D86-8A51-FD30FBEE7BD2"
+    Language="1033"
+    Scope="perMachine"
+    InstallerVersion="500"
+    Compressed="yes">
+
+    <SummaryInformation Description="Tenhou CSV Reader Installer" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <Property Id="INSTALLDESKTOPSHORTCUT" Value="1" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Tenhou CSV Reader" />
+    <Property Id="PREVIOUSINSTALLFOLDER">
+      <RegistrySearch
+        Id="FindPreviousInstallFolder"
+        Root="HKLM"
+        Key="Software\TenhouCsvReader"
+        Name="InstallLocation"
+        Type="raw" />
+    </Property>
+
+    <SetProperty
+      Id="INSTALLFOLDER"
+      Value="[PREVIOUSINSTALLFOLDER]"
+      Before="CostFinalize"
+      Condition="WIX_UPGRADE_DETECTED AND PREVIOUSINSTALLFOLDER" />
+
+    <CustomAction
+      Id="LaunchApplication"
+      Directory="INSTALLFOLDER"
+      ExeCommand="&quot;[INSTALLFOLDER]TenhouCsvReader.exe&quot;"
+      Execute="immediate"
+      Return="asyncNoWait" />
+
+    <ui:WixUI Id="WixUI_InstallDir" />
+
+    <UI>
+      <Dialog Id="InstallOptionsDlg" Width="370" Height="270" Title="Tenhou CSV Reader Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" Text="WixUI_Bmp_Banner" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="10" Width="340" Height="24" Transparent="yes" NoPrefix="yes" Text="Installation Options" />
+        <Control Id="Description" Type="Text" X="20" Y="60" Width="330" Height="30" Transparent="yes" NoPrefix="yes" Text="Choose whether to create a desktop shortcut." />
+
+        <Control
+          Id="DesktopShortcutCheckBox"
+          Type="CheckBox"
+          X="20"
+          Y="112"
+          Width="330"
+          Height="18"
+          Property="INSTALLDESKTOPSHORTCUT"
+          CheckBoxValue="1"
+          Text="Create desktop shortcut" />
+
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)">
+          <Publish Event="NewDialog" Value="InstallDirDlg" Condition="1" />
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)">
+          <Publish Event="NewDialog" Value="VerifyReadyDlg" Condition="1" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" Condition="1" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="UpgradeDetectedDlg" Width="370" Height="270" Title="Tenhou CSV Reader Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" Text="WixUI_Bmp_Banner" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="10" Width="340" Height="24" Transparent="yes" NoPrefix="yes" Text="Update Detected" />
+        <Control Id="Description" Type="Text" X="20" Y="60" Width="330" Height="70" Transparent="yes" NoPrefix="yes" Text="An existing installation was detected at [PREVIOUSINSTALLFOLDER]. Setup will update this installation in place." />
+
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)">
+          <Publish Event="NewDialog" Value="LicenseAgreementDlg" Condition="1" />
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)">
+          <Publish Event="NewDialog" Value="VerifyReadyDlg" Condition="1" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" Condition="1" />
+        </Control>
+      </Dialog>
+
+      <Publish
+        Dialog="LicenseAgreementDlg"
+        Control="Next"
+        Event="NewDialog"
+        Value="UpgradeDetectedDlg"
+        Order="300"
+        Condition="WIX_UPGRADE_DETECTED AND LicenseAccepted = &quot;1&quot;" />
+
+      <Publish
+        Dialog="InstallDirDlg"
+        Control="Next"
+        Event="NewDialog"
+        Value="InstallOptionsDlg"
+        Order="200"
+        Condition="NOT WIX_UPGRADE_DETECTED AND (WIXUI_DONTVALIDATEPATH OR WIXUI_INSTALLDIR_VALID = &quot;1&quot;)" />
+
+      <Publish
+        Dialog="InstallDirDlg"
+        Control="Next"
+        Event="NewDialog"
+        Value="VerifyReadyDlg"
+        Order="210"
+        Condition="WIX_UPGRADE_DETECTED AND (WIXUI_DONTVALIDATEPATH OR WIXUI_INSTALLDIR_VALID = &quot;1&quot;)" />
+
+      <Publish
+        Dialog="VerifyReadyDlg"
+        Control="Back"
+        Event="NewDialog"
+        Value="InstallOptionsDlg"
+        Order="200"
+        Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+
+      <Publish
+        Dialog="VerifyReadyDlg"
+        Control="Back"
+        Event="NewDialog"
+        Value="UpgradeDetectedDlg"
+        Order="210"
+        Condition="WIX_UPGRADE_DETECTED" />
+
+      <Publish
+        Dialog="ExitDialog"
+        Control="Finish"
+        Event="DoAction"
+        Value="LaunchApplication"
+        Order="1"
+        Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed" />
+    </UI>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="TenhouCsvReader" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ProgramMenuAppFolder" Name="Tenhou CSV Reader" />
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Tenhou CSV Reader" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="StartMenuShortcutComponent" />
+      <ComponentRef Id="DesktopShortcutComponent" />
+      <ComponentRef Id="InstallMetadataComponent" />
+      <ComponentRef Id="CsvOpenWithComponent" />
+      <ComponentRef Id="ApplicationOpenWithComponent" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(var.PublishDir)\\**" />
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="InstallMetadataComponent" Guid="*">
+        <RegistryValue
+          Root="HKLM"
+          Key="Software\TenhouCsvReader"
+          Name="InstallLocation"
+          Type="string"
+          Value="[INSTALLFOLDER]"
+          KeyPath="yes" />
+      </Component>
+
+      <Component Id="CsvOpenWithComponent" Guid="*">
+        <RegistryKey Root="HKLM" Key="Software\Classes\SystemFileAssociations\.csv\shell\OpenWithTenhouCsvReader">
+          <RegistryValue Name="MUIVerb" Type="string" Value="Open with Tenhou CSV Reader" />
+          <RegistryValue Name="Icon" Type="string" Value="[INSTALLFOLDER]TenhouCsvReader.exe" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\SystemFileAssociations\.csv\shell\OpenWithTenhouCsvReader\command">
+          <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]TenhouCsvReader.exe&quot; &quot;%L&quot;" KeyPath="yes" />
+        </RegistryKey>
+      </Component>
+
+      <Component Id="ApplicationOpenWithComponent" Guid="*">
+        <RegistryKey Root="HKLM" Key="Software\Classes\Applications\TenhouCsvReader.exe\shell\open\command">
+          <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]TenhouCsvReader.exe&quot; &quot;%L&quot;" KeyPath="yes" />
+        </RegistryKey>
+        <RegistryKey Root="HKLM" Key="Software\Classes\Applications\TenhouCsvReader.exe\SupportedTypes">
+          <RegistryValue Name=".csv" Type="string" Value="" />
+        </RegistryKey>
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+
+  <Fragment>
+    <DirectoryRef Id="ProgramMenuAppFolder">
+      <Component Id="StartMenuShortcutComponent" Guid="*">
+        <Shortcut
+          Id="ApplicationStartMenuShortcut"
+          Name="Tenhou CSV Reader"
+          Description="Open Tenhou CSV Reader"
+          Target="[INSTALLFOLDER]TenhouCsvReader.exe"
+          WorkingDirectory="INSTALLFOLDER" />
+
+        <Shortcut
+          Id="UninstallStartMenuShortcut"
+          Name="Uninstall Tenhou CSV Reader"
+          Description="Uninstall Tenhou CSV Reader"
+          Target="[SystemFolder]msiexec.exe"
+          Arguments="/x [ProductCode]" />
+
+        <RemoveFolder Id="RemoveProgramMenuAppFolder" Directory="ProgramMenuAppFolder" On="uninstall" />
+        <RegistryValue Root="HKCU" Key="Software\TenhouCsvReader" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+
+  <Fragment>
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcutComponent" Guid="*" Condition="INSTALLDESKTOPSHORTCUT = 1">
+        <Shortcut
+          Id="DesktopShortcut"
+          Name="Tenhou CSV Reader"
+          Description="Open Tenhou CSV Reader"
+          Target="[INSTALLFOLDER]TenhouCsvReader.exe"
+          WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\TenhouCsvReader" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+  </Fragment>
+</Wix>

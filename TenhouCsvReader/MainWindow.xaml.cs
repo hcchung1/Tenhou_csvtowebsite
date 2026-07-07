@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Data;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -22,6 +23,34 @@ namespace TenhouCsvReader;
 
 public partial class MainWindow : Window
 {
+    private enum SidePaneViewMode
+    {
+        Web = 0,
+        TrainingPlot = 1
+    }
+
+    private sealed class SourceSession
+    {
+        public required string SourcePath { get; init; }
+        public required string CsvPath { get; init; }
+        public required string DisplayPath { get; init; }
+        public string DisplayName { get; init; } = string.Empty;
+        public string? ExtractedRootPath { get; init; }
+        public string? CsvEntryInArchive { get; init; }
+        public IReadOnlyList<string> TrainingImagePaths { get; init; } = Array.Empty<string>();
+        public int SelectedImageIndex { get; set; }
+        public string ActiveFilterText { get; set; } = string.Empty;
+        public int CurrentPageIndex { get; set; }
+    }
+
+    private sealed class TrainingImageItem
+    {
+        public required string Name { get; init; }
+        public required string Path { get; init; }
+
+        public override string ToString() => Name;
+    }
+
     private readonly Style _defaultCellTextStyle;
     private readonly Style _tenhouLinkCellTextStyle;
 
@@ -40,16 +69,27 @@ public partial class MainWindow : Window
     private const double BrowserPaneMinGridWidth = 460;
     private double _lastBrowserPaneWidth = BrowserPaneDefaultWidth;
     private readonly string _uiStateFilePath;
+    private readonly string _sessionTempRootPath;
+    private readonly List<SourceSession> _sessions = new();
+    private SourceSession? _activeSession;
+    private SidePaneViewMode _sidePaneViewMode = SidePaneViewMode.Web;
+    private bool _isSwitchingSession;
+    private bool _isUpdatingTrainingImageSelection;
     private bool _isBusy;
     private bool _isBrowserPaneOpen;
     private bool _hasPreviousPage;
     private bool _hasNextPage;
+    private double _trainingImageZoom = 1.0;
+    private const double TrainingImageZoomMin = 0.2;
+    private const double TrainingImageZoomMax = 5.0;
+    private const double TrainingImageZoomStep = 0.1;
 
     public MainWindow()
     {
         InitializeComponent();
 
         _uiStateFilePath = BuildUiStateFilePath();
+        _sessionTempRootPath = BuildSessionTempRootPath();
         LoadUiState();
 
         TryApplyWindowIcon();
@@ -58,8 +98,10 @@ public partial class MainWindow : Window
         _defaultCellTextStyle = BuildCellTextStyle(showToolTip: false, isLinkStyle: false);
         _tenhouLinkCellTextStyle = BuildCellTextStyle(showToolTip: true, isLinkStyle: true);
 
+        ResetTrainingImageZoom();
         ApplyControlState();
         UpdateBrowserControlsState();
+        UpdateTrainingImagePanelForActiveSession();
         _ = EnsureSideBrowserInitializedAsync();
     }
 
@@ -125,13 +167,13 @@ public partial class MainWindow : Window
     protected override async void OnClosed(EventArgs e)
     {
         SaveUiState();
-        await DisposeReaderAsync();
+        await DisposeAllSessionsAsync();
         base.OnClosed(e);
     }
 
     private void Window_DragOver(object sender, DragEventArgs e)
     {
-        e.Effects = TryGetDroppedCsvPath(e.Data, out _)
+        e.Effects = TryGetDroppedInputPaths(e.Data, out var droppedPaths) && droppedPaths.Count > 0
             ? DragDropEffects.Copy
             : DragDropEffects.None;
         e.Handled = true;
@@ -146,14 +188,14 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (!TryGetDroppedCsvPath(e.Data, out var csvPath))
+        if (!TryGetDroppedInputPaths(e.Data, out var inputPaths) || inputPaths.Count == 0)
         {
-            IndexStatusTextBlock.Text = "Drop a single .csv file to open.";
+            IndexStatusTextBlock.Text = "Drop one or more .csv or .zip files to open.";
             e.Handled = true;
             return;
         }
 
-        await OpenCsvAsync(csvPath);
+        await OpenInputSourcesAsync(inputPaths);
         e.Handled = true;
     }
 
@@ -184,7 +226,7 @@ public partial class MainWindow : Window
         {
             Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*",
             CheckFileExists = true,
-            Multiselect = false
+            Multiselect = true
         };
 
         if (dialog.ShowDialog(this) != true)
@@ -192,18 +234,577 @@ public partial class MainWindow : Window
             return;
         }
 
-        await OpenCsvAsync(dialog.FileName);
+        await OpenInputSourcesAsync(dialog.FileNames);
+    }
+
+    private async void OpenZipButton_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new OpenFileDialog
+        {
+            Filter = "ZIP archives (*.zip)|*.zip|All supported files (*.zip;*.csv)|*.zip;*.csv|All files (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = true
+        };
+
+        if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+
+        await OpenInputSourcesAsync(dialog.FileNames);
+    }
+
+    private async void CloseTabButton_Click(object sender, RoutedEventArgs e)
+    {
+        await CloseCurrentTabAsync();
     }
 
     public async Task OpenCsvFromLaunchAsync(string filePath)
     {
-        if (!TryValidateCsvPath(filePath, out var normalizedPath, out var errorMessage))
+        if (!TryValidateInputPath(filePath, out var normalizedPath, out var errorMessage))
         {
             IndexStatusTextBlock.Text = $"Open startup file failed: {errorMessage}";
             return;
         }
 
-        await OpenCsvAsync(normalizedPath);
+        await OpenInputSourcesAsync([normalizedPath]);
+    }
+
+    private async void SessionTabControl_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_isSwitchingSession || !IsLoaded)
+        {
+            return;
+        }
+
+        if (SessionTabControl.SelectedItem is not TabItem selectedTab || selectedTab.Tag is not SourceSession session)
+        {
+            return;
+        }
+
+        await OpenSessionAsync(session, preserveState: true);
+    }
+
+    private void TrainingImageComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_isUpdatingTrainingImageSelection || _activeSession is null)
+        {
+            return;
+        }
+
+        if (TrainingImageComboBox.SelectedItem is not TrainingImageItem selectedImage)
+        {
+            return;
+        }
+
+        _activeSession.SelectedImageIndex = TrainingImageComboBox.SelectedIndex;
+        ShowTrainingImage(selectedImage.Path);
+    }
+
+    private void TrainingImageZoomOutButton_Click(object sender, RoutedEventArgs e)
+    {
+        AdjustTrainingImageZoom(-TrainingImageZoomStep);
+    }
+
+    private void TrainingImageZoomInButton_Click(object sender, RoutedEventArgs e)
+    {
+        AdjustTrainingImageZoom(TrainingImageZoomStep);
+    }
+
+    private void TrainingImageZoomResetButton_Click(object sender, RoutedEventArgs e)
+    {
+        ResetTrainingImageZoom();
+    }
+
+    private void TrainingImageScrollViewer_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
+    {
+        if ((Keyboard.Modifiers & ModifierKeys.Control) == 0)
+        {
+            return;
+        }
+
+        var delta = e.Delta > 0 ? TrainingImageZoomStep : -TrainingImageZoomStep;
+        AdjustTrainingImageZoom(delta);
+        e.Handled = true;
+    }
+
+    private async Task OpenInputSourcesAsync(IEnumerable<string> rawPaths)
+    {
+        var normalizedPaths = new List<string>();
+        string? lastValidationError = null;
+
+        foreach (var rawPath in rawPaths)
+        {
+            if (TryValidateInputPath(rawPath, out var normalizedPath, out var errorMessage))
+            {
+                normalizedPaths.Add(normalizedPath);
+            }
+            else if (!string.IsNullOrWhiteSpace(errorMessage))
+            {
+                lastValidationError = errorMessage;
+            }
+        }
+
+        if (normalizedPaths.Count == 0)
+        {
+            IndexStatusTextBlock.Text = lastValidationError is null
+                ? "No supported files selected."
+                : $"Open failed: {lastValidationError}";
+            return;
+        }
+
+        foreach (var normalizedPath in normalizedPaths)
+        {
+            var existingSession = _sessions.FirstOrDefault(session =>
+                string.Equals(session.SourcePath, normalizedPath, StringComparison.OrdinalIgnoreCase));
+
+            if (existingSession is not null)
+            {
+                SelectSessionTab(existingSession);
+                await OpenSessionAsync(existingSession, preserveState: true);
+                continue;
+            }
+
+            SourceSession newSession;
+
+            try
+            {
+                newSession = await CreateSourceSessionAsync(normalizedPath);
+            }
+            catch (Exception ex)
+            {
+                IndexStatusTextBlock.Text = $"Open failed ({Path.GetFileName(normalizedPath)}): {ex.Message}";
+                continue;
+            }
+
+            _sessions.Add(newSession);
+            AddSessionTab(newSession);
+            SelectSessionTab(newSession);
+            await OpenSessionAsync(newSession, preserveState: true, forceReload: true);
+        }
+
+        ApplyControlState();
+    }
+
+    private async Task OpenSessionAsync(SourceSession session, bool preserveState, bool forceReload = false)
+    {
+        if (preserveState)
+        {
+            PersistActiveSessionState();
+        }
+
+        if (!forceReload && ReferenceEquals(_activeSession, session) && _reader is not null)
+        {
+            UpdateTrainingImagePanelForActiveSession();
+            ApplyControlState();
+            return;
+        }
+
+        _activeSession = session;
+        UpdateTrainingImagePanelForActiveSession();
+
+        await OpenCsvAsync(
+            filePath: session.CsvPath,
+            displayPathOverride: session.DisplayPath,
+            restoreFilterText: session.ActiveFilterText,
+            restorePageIndex: session.CurrentPageIndex);
+
+        ApplyControlState();
+    }
+
+    private async Task CloseCurrentTabAsync()
+    {
+        if (SessionTabControl.SelectedItem is not TabItem selectedTab || selectedTab.Tag is not SourceSession selectedSession)
+        {
+            IndexStatusTextBlock.Text = "No tab to close.";
+            return;
+        }
+
+        PersistActiveSessionState();
+
+        var wasActiveSession = ReferenceEquals(selectedSession, _activeSession);
+
+        _isSwitchingSession = true;
+        SessionTabControl.Items.Remove(selectedTab);
+        _isSwitchingSession = false;
+
+        _sessions.Remove(selectedSession);
+
+        if (wasActiveSession)
+        {
+            await DisposeReaderAsync();
+            _activeSession = null;
+        }
+
+        CleanupSessionTempFiles(selectedSession);
+
+        if (SessionTabControl.Items.Count == 0)
+        {
+            await ResetToEmptyStateAsync();
+            ApplyControlState();
+            return;
+        }
+
+        var nextTab = SessionTabControl.SelectedItem as TabItem ?? (TabItem)SessionTabControl.Items[0];
+        if (nextTab.Tag is not SourceSession nextSession)
+        {
+            await ResetToEmptyStateAsync();
+            ApplyControlState();
+            return;
+        }
+
+        SelectSessionTab(nextSession);
+        await OpenSessionAsync(nextSession, preserveState: false, forceReload: true);
+    }
+
+    private async Task<SourceSession> CreateSourceSessionAsync(string normalizedPath)
+    {
+        var extension = Path.GetExtension(normalizedPath);
+
+        if (string.Equals(extension, ".csv", StringComparison.OrdinalIgnoreCase))
+        {
+            return new SourceSession
+            {
+                SourcePath = normalizedPath,
+                CsvPath = normalizedPath,
+                DisplayPath = normalizedPath,
+                DisplayName = BuildSessionDisplayName(normalizedPath, isArchive: false)
+            };
+        }
+
+        if (!string.Equals(extension, ".zip", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("Only .csv and .zip are supported.");
+        }
+
+        IndexStatusTextBlock.Text = $"Extracting archive: {Path.GetFileName(normalizedPath)}";
+
+        var sessionFolderName = $"{DateTime.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}";
+        var sessionRootPath = Path.Combine(_sessionTempRootPath, sessionFolderName);
+        Directory.CreateDirectory(sessionRootPath);
+
+        try
+        {
+            using var archive = ZipFile.OpenRead(normalizedPath);
+            var csvEntries = archive.Entries
+                .Where(entry => IsArchiveFileEntry(entry) &&
+                                string.Equals(Path.GetExtension(entry.Name), ".csv", StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(entry => entry.Name.Contains("pred", StringComparison.OrdinalIgnoreCase))
+                .ThenByDescending(entry => entry.Length)
+                .ThenBy(entry => entry.FullName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (csvEntries.Count == 0)
+            {
+                throw new InvalidDataException("No CSV file found in zip.");
+            }
+
+            var csvEntry = csvEntries[0];
+            var extractedCsvPath = await ExtractArchiveEntryAsync(csvEntry, sessionRootPath, "csv");
+
+            var pngEntries = archive.Entries
+                .Where(entry => IsArchiveFileEntry(entry) &&
+                                string.Equals(Path.GetExtension(entry.Name), ".png", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(entry => entry.FullName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var extractedPngPaths = new List<string>(pngEntries.Count);
+
+            foreach (var pngEntry in pngEntries)
+            {
+                var extractedPngPath = await ExtractArchiveEntryAsync(pngEntry, sessionRootPath, "images");
+                extractedPngPaths.Add(extractedPngPath);
+            }
+
+            var displayPath = $"{normalizedPath} | CSV: {csvEntry.FullName}";
+
+            return new SourceSession
+            {
+                SourcePath = normalizedPath,
+                CsvPath = extractedCsvPath,
+                DisplayPath = displayPath,
+                DisplayName = BuildSessionDisplayName(normalizedPath, isArchive: true),
+                ExtractedRootPath = sessionRootPath,
+                CsvEntryInArchive = csvEntry.FullName,
+                TrainingImagePaths = extractedPngPaths
+            };
+        }
+        catch
+        {
+            CleanupDirectoryIfExists(sessionRootPath);
+            throw;
+        }
+    }
+
+    private static bool IsArchiveFileEntry(ZipArchiveEntry entry)
+    {
+        return !string.IsNullOrWhiteSpace(entry.Name);
+    }
+
+    private static async Task<string> ExtractArchiveEntryAsync(ZipArchiveEntry entry, string sessionRootPath, string categoryFolder)
+    {
+        var categoryRootPath = Path.GetFullPath(Path.Combine(sessionRootPath, categoryFolder));
+        Directory.CreateDirectory(categoryRootPath);
+
+        var relativePath = entry.FullName
+            .Replace('/', Path.DirectorySeparatorChar)
+            .TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        if (string.IsNullOrWhiteSpace(relativePath))
+        {
+            throw new InvalidDataException("Archive entry path is empty.");
+        }
+
+        var extractedPath = Path.GetFullPath(Path.Combine(categoryRootPath, relativePath));
+        var normalizedCategoryRootPath = categoryRootPath.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+
+        if (!extractedPath.StartsWith(normalizedCategoryRootPath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException($"Archive contains unsafe path: {entry.FullName}");
+        }
+
+        var destinationFolderPath = Path.GetDirectoryName(extractedPath);
+        if (!string.IsNullOrWhiteSpace(destinationFolderPath))
+        {
+            Directory.CreateDirectory(destinationFolderPath);
+        }
+
+        await using var outputStream = new FileStream(
+            path: extractedPath,
+            mode: FileMode.Create,
+            access: FileAccess.Write,
+            share: FileShare.None,
+            bufferSize: 64 * 1024,
+            useAsync: true);
+
+        await using var inputStream = entry.Open();
+        await inputStream.CopyToAsync(outputStream);
+
+        return extractedPath;
+    }
+
+    private void AddSessionTab(SourceSession session)
+    {
+        var tabItem = new TabItem
+        {
+            Header = session.DisplayName,
+            Tag = session,
+            ToolTip = session.DisplayPath
+        };
+
+        SessionTabControl.Items.Add(tabItem);
+    }
+
+    private void SelectSessionTab(SourceSession session)
+    {
+        var tab = SessionTabControl.Items
+            .OfType<TabItem>()
+            .FirstOrDefault(item => ReferenceEquals(item.Tag, session));
+
+        if (tab is null)
+        {
+            return;
+        }
+
+        _isSwitchingSession = true;
+        SessionTabControl.SelectedItem = tab;
+        _isSwitchingSession = false;
+    }
+
+    private void PersistActiveSessionState()
+    {
+        if (_activeSession is null)
+        {
+            return;
+        }
+
+        _activeSession.ActiveFilterText = _activeFilterText;
+        _activeSession.CurrentPageIndex = _currentPageIndex;
+
+        if (TrainingImageComboBox.SelectedIndex >= 0)
+        {
+            _activeSession.SelectedImageIndex = TrainingImageComboBox.SelectedIndex;
+        }
+    }
+
+    private async Task ResetToEmptyStateAsync()
+    {
+        await DisposeReaderAsync();
+        _activeSession = null;
+        _activeFilePath = null;
+        _activeFilterText = string.Empty;
+        _currentPageIndex = 0;
+        _displayHeaders = Array.Empty<string>();
+        _hasPreviousPage = false;
+        _hasNextPage = false;
+
+        CsvDataGrid.ItemsSource = null;
+        FilePathTextBlock.Text = "No file loaded.";
+        FilterTextBox.Text = string.Empty;
+        GoToPageTextBox.Text = "1";
+        PageInfoTextBlock.Text = string.Empty;
+        IndexStatusTextBlock.Text = "No file loaded.";
+        UpdateTrainingImagePanelForActiveSession();
+    }
+
+    private void ResetTrainingImageZoom()
+    {
+        SetTrainingImageZoom(1.0);
+    }
+
+    private void AdjustTrainingImageZoom(double delta)
+    {
+        SetTrainingImageZoom(_trainingImageZoom + delta);
+    }
+
+    private void SetTrainingImageZoom(double newZoom)
+    {
+        _trainingImageZoom = Math.Clamp(newZoom, TrainingImageZoomMin, TrainingImageZoomMax);
+        ApplyTrainingImageZoom();
+    }
+
+    private void ApplyTrainingImageZoom()
+    {
+        TrainingImageScaleTransform.ScaleX = _trainingImageZoom;
+        TrainingImageScaleTransform.ScaleY = _trainingImageZoom;
+        TrainingImageZoomTextBlock.Text = $"{_trainingImageZoom * 100:0}%";
+
+        var hasImage = TrainingImageViewer.Source is not null;
+        TrainingImageZoomOutButton.IsEnabled = hasImage && !_isBusy && _trainingImageZoom > TrainingImageZoomMin + 0.0001;
+        TrainingImageZoomInButton.IsEnabled = hasImage && !_isBusy && _trainingImageZoom < TrainingImageZoomMax - 0.0001;
+        TrainingImageZoomResetButton.IsEnabled = hasImage && !_isBusy && Math.Abs(_trainingImageZoom - 1.0) > 0.0001;
+    }
+
+    private void UpdateTrainingImagePanelForActiveSession()
+    {
+        if (_activeSession is null || _activeSession.TrainingImagePaths.Count == 0)
+        {
+            _isUpdatingTrainingImageSelection = true;
+            TrainingImageComboBox.ItemsSource = null;
+            TrainingImageComboBox.SelectedIndex = -1;
+            _isUpdatingTrainingImageSelection = false;
+            TrainingImageStatusTextBlock.Text = string.Empty;
+            TrainingImageViewer.Source = null;
+            ResetTrainingImageZoom();
+            SideTrainingPlotPane.Visibility = Visibility.Collapsed;
+
+            if (_sidePaneViewMode == SidePaneViewMode.TrainingPlot)
+            {
+                SetSidePaneMode(SidePaneViewMode.Web, ensurePaneVisible: false);
+            }
+
+            ApplyControlState();
+            return;
+        }
+
+        var imageItems = _activeSession.TrainingImagePaths
+            .Select(path => new TrainingImageItem
+            {
+                Name = Path.GetFileName(path),
+                Path = path
+            })
+            .ToList();
+
+        _isUpdatingTrainingImageSelection = true;
+        TrainingImageComboBox.ItemsSource = imageItems;
+        if (imageItems.Count == 0)
+        {
+            TrainingImageComboBox.SelectedIndex = -1;
+            TrainingImageStatusTextBlock.Text = "No PNG image found.";
+            TrainingImageViewer.Source = null;
+            ResetTrainingImageZoom();
+            _isUpdatingTrainingImageSelection = false;
+            return;
+        }
+
+        var selectedIndex = Math.Clamp(_activeSession.SelectedImageIndex, 0, imageItems.Count - 1);
+        _activeSession.SelectedImageIndex = selectedIndex;
+        TrainingImageComboBox.SelectedIndex = selectedIndex;
+        _isUpdatingTrainingImageSelection = false;
+
+        ShowTrainingImage(imageItems[selectedIndex].Path);
+
+        if (!_isBrowserPaneOpen)
+        {
+            SetSidePaneMode(SidePaneViewMode.TrainingPlot, ensurePaneVisible: true);
+        }
+        else
+        {
+            if (_sidePaneViewMode == SidePaneViewMode.TrainingPlot)
+            {
+                SideTrainingPlotPane.Visibility = Visibility.Visible;
+            }
+
+            ApplyControlState();
+        }
+    }
+
+    private void ShowTrainingImage(string imagePath)
+    {
+        if (!File.Exists(imagePath))
+        {
+            TrainingImageViewer.Source = null;
+            TrainingImageStatusTextBlock.Text = "Image file not found.";
+            ResetTrainingImageZoom();
+            return;
+        }
+
+        try
+        {
+            using var stream = new FileStream(
+                path: imagePath,
+                mode: FileMode.Open,
+                access: FileAccess.Read,
+                share: FileShare.ReadWrite | FileShare.Delete);
+
+            var image = new BitmapImage();
+            image.BeginInit();
+            image.CacheOption = BitmapCacheOption.OnLoad;
+            image.StreamSource = stream;
+            image.EndInit();
+            image.Freeze();
+
+            TrainingImageViewer.Source = image;
+            TrainingImageStatusTextBlock.Text = Path.GetFileName(imagePath);
+            ResetTrainingImageZoom();
+        }
+        catch (Exception ex)
+        {
+            TrainingImageViewer.Source = null;
+            TrainingImageStatusTextBlock.Text = $"Load image failed: {ex.Message}";
+            ResetTrainingImageZoom();
+        }
+    }
+
+    private static string BuildSessionDisplayName(string path, bool isArchive)
+    {
+        var fileName = Path.GetFileName(path);
+        return isArchive ? $"ZIP: {fileName}" : $"CSV: {fileName}";
+    }
+
+    private void CleanupSessionTempFiles(SourceSession session)
+    {
+        if (string.IsNullOrWhiteSpace(session.ExtractedRootPath))
+        {
+            return;
+        }
+
+        CleanupDirectoryIfExists(session.ExtractedRootPath);
+    }
+
+    private static void CleanupDirectoryIfExists(string directoryPath)
+    {
+        try
+        {
+            if (Directory.Exists(directoryPath))
+            {
+                Directory.Delete(directoryPath, recursive: true);
+            }
+        }
+        catch
+        {
+            // Ignore best-effort cleanup failures.
+        }
     }
 
     private async void PreviousPageButton_Click(object sender, RoutedEventArgs e)
@@ -230,12 +831,12 @@ public partial class MainWindow : Window
 
     private async void PageSizeComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (!IsLoaded || _reader is null || string.IsNullOrWhiteSpace(_activeFilePath))
+        if (!IsLoaded || _activeSession is null)
         {
             return;
         }
 
-        await OpenCsvAsync(_activeFilePath);
+        await OpenSessionAsync(_activeSession, preserveState: true, forceReload: true);
     }
 
     private async void ApplyFilterButton_Click(object sender, RoutedEventArgs e)
@@ -442,7 +1043,7 @@ public partial class MainWindow : Window
     private void BrowserBackButton_Click(object sender, RoutedEventArgs e)
     {
         var core = SideBrowser.CoreWebView2;
-        if (!_isBrowserPaneOpen || core is null || !core.CanGoBack)
+        if (!_isBrowserPaneOpen || _sidePaneViewMode != SidePaneViewMode.Web || core is null || !core.CanGoBack)
         {
             return;
         }
@@ -454,7 +1055,7 @@ public partial class MainWindow : Window
     private void BrowserForwardButton_Click(object sender, RoutedEventArgs e)
     {
         var core = SideBrowser.CoreWebView2;
-        if (!_isBrowserPaneOpen || core is null || !core.CanGoForward)
+        if (!_isBrowserPaneOpen || _sidePaneViewMode != SidePaneViewMode.Web || core is null || !core.CanGoForward)
         {
             return;
         }
@@ -466,13 +1067,30 @@ public partial class MainWindow : Window
     private void BrowserRefreshButton_Click(object sender, RoutedEventArgs e)
     {
         var core = SideBrowser.CoreWebView2;
-        if (!_isBrowserPaneOpen || core is null)
+        if (!_isBrowserPaneOpen || _sidePaneViewMode != SidePaneViewMode.Web || core is null)
         {
             return;
         }
 
         core.Reload();
         UpdateBrowserControlsState();
+    }
+
+    private void BrowserPaneToggleViewButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_sidePaneViewMode == SidePaneViewMode.Web)
+        {
+            if (_activeSession is null || _activeSession.TrainingImagePaths.Count == 0)
+            {
+                IndexStatusTextBlock.Text = "No training PNG available for this tab.";
+                return;
+            }
+
+            SetSidePaneMode(SidePaneViewMode.TrainingPlot, ensurePaneVisible: true);
+            return;
+        }
+
+        SetSidePaneMode(SidePaneViewMode.Web, ensurePaneVisible: true);
     }
 
     private void BrowserAddressTextBox_KeyDown(object sender, KeyEventArgs e)
@@ -482,13 +1100,19 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (_sidePaneViewMode != SidePaneViewMode.Web)
+        {
+            e.Handled = true;
+            return;
+        }
+
         NavigateSideBrowser(BrowserAddressTextBox.Text);
         e.Handled = true;
     }
 
     private void BrowserOpenExternalButton_Click(object sender, RoutedEventArgs e)
     {
-        if (!_isBrowserPaneOpen || string.IsNullOrWhiteSpace(_currentEmbeddedUrl))
+        if (!_isBrowserPaneOpen || _sidePaneViewMode != SidePaneViewMode.Web || string.IsNullOrWhiteSpace(_currentEmbeddedUrl))
         {
             return;
         }
@@ -604,7 +1228,11 @@ public partial class MainWindow : Window
         e.Handled = true;
     }
 
-    private async Task OpenCsvAsync(string filePath)
+    private async Task OpenCsvAsync(
+        string filePath,
+        string? displayPathOverride = null,
+        string? restoreFilterText = null,
+        int restorePageIndex = 0)
     {
         await DisposeReaderAsync();
 
@@ -619,14 +1247,26 @@ public partial class MainWindow : Window
             _activeFilePath = filePath;
             _displayHeaders = BuildUniqueColumnNames(_reader.Headers);
             _activeFilterText = string.Empty;
+            _currentPageIndex = 0;
 
-            FilePathTextBlock.Text = filePath;
+            var displayPath = string.IsNullOrWhiteSpace(displayPathOverride) ? filePath : displayPathOverride;
+            FilePathTextBlock.Text = displayPath;
             FilterTextBox.Text = string.Empty;
             GoToPageTextBox.Text = "1";
             PageInfoTextBlock.Text = "Loading page 1...";
             CsvDataGrid.ItemsSource = null;
 
-            await LoadPageAsync(0);
+            if (!string.IsNullOrWhiteSpace(restoreFilterText))
+            {
+                FilterTextBox.Text = restoreFilterText;
+                var filterRestored = await TryApplyFilterAsync(restoreFilterText, loadFirstPage: false);
+                if (!filterRestored)
+                {
+                    FilterTextBox.Text = string.Empty;
+                }
+            }
+
+            await LoadPageAsync(Math.Max(0, restorePageIndex));
             StartBackgroundIndexing();
         }
         catch (Exception ex)
@@ -650,10 +1290,27 @@ public partial class MainWindow : Window
         }
 
         var filterText = FilterTextBox.Text.Trim();
+        var success = await TryApplyFilterAsync(filterText, loadFirstPage: true);
+        if (!success)
+        {
+            return;
+        }
+
+        StartBackgroundIndexing();
+    }
+
+    private async Task<bool> TryApplyFilterAsync(string filterText, bool loadFirstPage)
+    {
+        if (_reader is null)
+        {
+            IndexStatusTextBlock.Text = "Open a CSV file first.";
+            return false;
+        }
+
         if (string.IsNullOrWhiteSpace(filterText))
         {
             IndexStatusTextBlock.Text = "Filter text is empty.";
-            return;
+            return false;
         }
 
         try
@@ -662,7 +1319,7 @@ public partial class MainWindow : Window
             if (conditions.Count == 0)
             {
                 IndexStatusTextBlock.Text = "Filter text is empty.";
-                return;
+                return false;
             }
 
             var newFilteredReader = _reader.CreateFilteredReader(conditions);
@@ -670,22 +1327,34 @@ public partial class MainWindow : Window
             await ClearFilterAsync(reloadData: false);
             _filteredReader = newFilteredReader;
             _activeFilterText = filterText;
+            if (_activeSession is not null)
+            {
+                _activeSession.ActiveFilterText = filterText;
+            }
 
-            GoToPageTextBox.Text = "1";
-            PageInfoTextBlock.Text = "Loading filtered page 1...";
+            if (loadFirstPage)
+            {
+                GoToPageTextBox.Text = "1";
+                PageInfoTextBlock.Text = "Loading filtered page 1...";
+                await LoadPageAsync(0);
+            }
 
-            await LoadPageAsync(0);
-            StartBackgroundIndexing();
+            return true;
         }
         catch (Exception ex)
         {
             IndexStatusTextBlock.Text = $"Filter error: {ex.Message}";
+            return false;
         }
     }
 
     private async Task ClearFilterAsync(bool reloadData)
     {
         _activeFilterText = string.Empty;
+        if (_activeSession is not null)
+        {
+            _activeSession.ActiveFilterText = string.Empty;
+        }
 
         await DisposeFilteredReaderAsync();
 
@@ -728,6 +1397,11 @@ public partial class MainWindow : Window
             }
 
             _currentPageIndex = page.PageIndex;
+            if (_activeSession is not null)
+            {
+                _activeSession.CurrentPageIndex = page.PageIndex;
+                _activeSession.ActiveFilterText = _activeFilterText;
+            }
 
             var table = BuildDataTable(_displayHeaders, page.Rows);
             CsvDataGrid.ItemsSource = table.DefaultView;
@@ -1074,6 +1748,7 @@ public partial class MainWindow : Window
     private void OpenLinkInSidePane(string link)
     {
         ShowBrowserPane();
+        SetSidePaneMode(SidePaneViewMode.Web, ensurePaneVisible: false);
         NavigateSideBrowser(link);
     }
 
@@ -1086,7 +1761,31 @@ public partial class MainWindow : Window
 
         EnsureBrowserPaneLayout(useDefaultWhenCollapsed: true);
         _ = EnsureSideBrowserInitializedAsync();
+        SetSidePaneMode(_sidePaneViewMode, ensurePaneVisible: false);
         UpdateBrowserControlsState();
+    }
+
+    private void SetSidePaneMode(SidePaneViewMode mode, bool ensurePaneVisible)
+    {
+        if (ensurePaneVisible)
+        {
+            ShowBrowserPane();
+        }
+
+        var hasTrainingImage = _activeSession is not null && _activeSession.TrainingImagePaths.Count > 0;
+        if (mode == SidePaneViewMode.TrainingPlot && !hasTrainingImage)
+        {
+            mode = SidePaneViewMode.Web;
+        }
+
+        _sidePaneViewMode = mode;
+
+        var showWeb = mode == SidePaneViewMode.Web;
+        SideBrowser.Visibility = showWeb ? Visibility.Visible : Visibility.Collapsed;
+        SideTrainingPlotPane.Visibility = showWeb ? Visibility.Collapsed : Visibility.Visible;
+        BrowserPaneToggleViewButton.Content = showWeb ? "Show Plot" : "Show Web";
+
+        ApplyControlState();
     }
 
     private void EnsureBrowserPaneLayout(bool useDefaultWhenCollapsed)
@@ -1134,6 +1833,7 @@ public partial class MainWindow : Window
         }
 
         BrowserAddressTextBox.Text = string.Empty;
+        SideTrainingPlotPane.Visibility = Visibility.Collapsed;
         BrowserPane.Visibility = Visibility.Collapsed;
         BrowserSplitter.Visibility = Visibility.Collapsed;
         BrowserSplitterColumn.Width = new GridLength(0);
@@ -1157,28 +1857,19 @@ public partial class MainWindow : Window
         try
         {
             ShowBrowserPane();
+            SetSidePaneMode(SidePaneViewMode.Web, ensurePaneVisible: false);
             _currentEmbeddedUrl = url;
             BrowserAddressTextBox.Text = url;
             if (SideBrowser.CoreWebView2 is not null)
             {
                 var core = SideBrowser.CoreWebView2;
-                if (string.Equals(core.Source, url, StringComparison.OrdinalIgnoreCase))
-                {
-                    core.Reload();
-                }
-                else
-                {
-                    core.Navigate(url);
-                }
+                core.Stop();
+                core.Navigate("about:blank");
+                core.Navigate(url);
             }
             else
             {
-                if (SideBrowser.Source is not null &&
-                    string.Equals(SideBrowser.Source.AbsoluteUri, url, StringComparison.OrdinalIgnoreCase))
-                {
-                    SideBrowser.Source = new Uri("about:blank");
-                }
-
+                SideBrowser.Source = new Uri("about:blank");
                 SideBrowser.Source = new Uri(url);
             }
 
@@ -1198,13 +1889,16 @@ public partial class MainWindow : Window
     {
         var isOpen = _isBrowserPaneOpen;
         var hasUrl = !string.IsNullOrWhiteSpace(_currentEmbeddedUrl);
+        var hasTrainingImage = _activeSession is not null && _activeSession.TrainingImagePaths.Count > 0;
+        var isWebMode = _sidePaneViewMode == SidePaneViewMode.Web;
         var core = SideBrowser.CoreWebView2;
 
-        BrowserAddressTextBox.IsEnabled = isOpen && core is not null;
-        BrowserBackButton.IsEnabled = isOpen && core?.CanGoBack == true;
-        BrowserForwardButton.IsEnabled = isOpen && core?.CanGoForward == true;
-        BrowserRefreshButton.IsEnabled = isOpen && core is not null && hasUrl;
-        BrowserOpenExternalButton.IsEnabled = isOpen && hasUrl;
+        BrowserPaneToggleViewButton.IsEnabled = isOpen && hasTrainingImage;
+        BrowserAddressTextBox.IsEnabled = isOpen && isWebMode && core is not null;
+        BrowserBackButton.IsEnabled = isOpen && isWebMode && core?.CanGoBack == true;
+        BrowserForwardButton.IsEnabled = isOpen && isWebMode && core?.CanGoForward == true;
+        BrowserRefreshButton.IsEnabled = isOpen && isWebMode && core is not null && hasUrl;
+        BrowserOpenExternalButton.IsEnabled = isOpen && isWebMode && hasUrl;
         BrowserCloseButton.IsEnabled = isOpen;
     }
 
@@ -1245,6 +1939,17 @@ public partial class MainWindow : Window
         }
 
         return Path.Combine(localAppData, "TenhouCsvReader", "ui-state.txt");
+    }
+
+    private static string BuildSessionTempRootPath()
+    {
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (string.IsNullOrWhiteSpace(localAppData))
+        {
+            localAppData = AppContext.BaseDirectory;
+        }
+
+        return Path.Combine(localAppData, "TenhouCsvReader", "sessions");
     }
 
     private void LoadUiState()
@@ -1526,36 +2231,42 @@ public partial class MainWindow : Window
         return false;
     }
 
-    private static bool TryGetDroppedCsvPath(IDataObject dataObject, out string csvPath)
+    private static bool TryGetDroppedInputPaths(IDataObject dataObject, out IReadOnlyList<string> inputPaths)
     {
-        csvPath = string.Empty;
+        inputPaths = Array.Empty<string>();
 
         if (!dataObject.GetDataPresent(DataFormats.FileDrop))
         {
             return false;
         }
 
-        if (dataObject.GetData(DataFormats.FileDrop) is not string[] droppedPaths || droppedPaths.Length != 1)
+        if (dataObject.GetData(DataFormats.FileDrop) is not string[] droppedPaths || droppedPaths.Length == 0)
         {
             return false;
         }
 
-        var candidatePath = droppedPaths[0];
-        if (string.IsNullOrWhiteSpace(candidatePath) || !File.Exists(candidatePath))
+        var validPaths = new List<string>(droppedPaths.Length);
+
+        foreach (var droppedPath in droppedPaths)
+        {
+            if (!TryValidateInputPath(droppedPath, out var normalizedPath, out _))
+            {
+                continue;
+            }
+
+            validPaths.Add(normalizedPath);
+        }
+
+        if (validPaths.Count == 0)
         {
             return false;
         }
 
-        if (!string.Equals(Path.GetExtension(candidatePath), ".csv", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        csvPath = candidatePath;
+        inputPaths = validPaths;
         return true;
     }
 
-    private static bool TryValidateCsvPath(string filePath, out string normalizedPath, out string errorMessage)
+    private static bool TryValidateInputPath(string filePath, out string normalizedPath, out string errorMessage)
     {
         normalizedPath = string.Empty;
         errorMessage = string.Empty;
@@ -1595,9 +2306,11 @@ public partial class MainWindow : Window
             return false;
         }
 
-        if (!string.Equals(Path.GetExtension(normalizedPath), ".csv", StringComparison.OrdinalIgnoreCase))
+        var extension = Path.GetExtension(normalizedPath);
+        if (!string.Equals(extension, ".csv", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(extension, ".zip", StringComparison.OrdinalIgnoreCase))
         {
-            errorMessage = "only .csv files are supported.";
+            errorMessage = "only .csv and .zip files are supported.";
             return false;
         }
 
@@ -1613,10 +2326,18 @@ public partial class MainWindow : Window
     private void ApplyControlState()
     {
         var hasReader = _reader is not null;
+        var hasTabs = SessionTabControl.Items.Count > 0;
 
         OpenCsvButton.IsEnabled = !_isBusy;
+        OpenZipButton.IsEnabled = !_isBusy;
+        CloseTabButton.IsEnabled = !_isBusy && hasTabs;
+        SessionTabControl.IsEnabled = !_isBusy && hasTabs;
         PageSizeComboBox.IsEnabled = !_isBusy;
         BackgroundIndexCheckBox.IsEnabled = !_isBusy;
+        TrainingImageComboBox.IsEnabled = !_isBusy &&
+                                          _isBrowserPaneOpen &&
+                                          _sidePaneViewMode == SidePaneViewMode.TrainingPlot &&
+                                          _activeSession?.TrainingImagePaths.Count > 1;
 
         FilterTextBox.IsEnabled = hasReader && !_isBusy;
         ApplyFilterButton.IsEnabled = hasReader && !_isBusy;
@@ -1627,6 +2348,8 @@ public partial class MainWindow : Window
 
         PreviousPageButton.IsEnabled = hasReader && !_isBusy && _hasPreviousPage;
         NextPageButton.IsEnabled = hasReader && !_isBusy && _hasNextPage;
+        UpdateBrowserControlsState();
+        ApplyTrainingImageZoom();
     }
 
     private async Task DisposeFilteredReaderAsync()
@@ -1667,5 +2390,24 @@ public partial class MainWindow : Window
         _hasNextPage = false;
         _displayHeaders = Array.Empty<string>();
         ApplyControlState();
+    }
+
+    private async Task DisposeAllSessionsAsync()
+    {
+        await DisposeReaderAsync();
+
+        foreach (var session in _sessions)
+        {
+            CleanupSessionTempFiles(session);
+        }
+
+        _sessions.Clear();
+        _activeSession = null;
+
+        _isSwitchingSession = true;
+        SessionTabControl.Items.Clear();
+        _isSwitchingSession = false;
+
+        CleanupDirectoryIfExists(_sessionTempRootPath);
     }
 }

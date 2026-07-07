@@ -13,7 +13,7 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
-        var startupCsvPath = TryResolveStartupCsvPath(e.Args);
+        var startupCsvPath = TryResolveStartupInputPath(e.Args);
         var mainWindow = new MainWindow();
         MainWindow = mainWindow;
         mainWindow.Show();
@@ -26,7 +26,7 @@ public partial class App : Application
         _ = mainWindow.OpenCsvFromLaunchAsync(startupCsvPath);
     }
 
-    private static string? TryResolveStartupCsvPath(string[] args)
+    private static string? TryResolveStartupInputPath(string[] args)
     {
         var allArgs = args
             .Concat(Environment.GetCommandLineArgs().Skip(1))
@@ -39,7 +39,9 @@ public partial class App : Application
                 continue;
             }
 
-            if (!string.Equals(Path.GetExtension(candidatePath), ".csv", StringComparison.OrdinalIgnoreCase))
+            var extension = Path.GetExtension(candidatePath);
+            if (!string.Equals(extension, ".csv", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(extension, ".zip", StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
